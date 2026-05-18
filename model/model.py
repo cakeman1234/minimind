@@ -78,6 +78,7 @@ class MokioMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from transformers.activations import ACT2FN
 
 # -------------------实现rmsnorm—-------------
 class RMSNorm(nn.Module):
@@ -268,4 +269,23 @@ class Attention(nn.Module):
         return output, past_kv
         
     
-            
+class FeedForward(nn.Module):
+    def __init__(self, args:MokioMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size * 8 / 3)
+            args.intermediate_size = 64 * ((intermediate_size + 63) // 64)  # 向上取整到64的倍数
+        
+        # 升维
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        # 降维
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        # 门控
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+
+        self.dropout = nn.Dropout(args.dropout)
+        self.act_fn = ACT2FN[args.hidden_act]
+
+    def forward(self, x:torch.Tensor):
+        return self.dropout(self.down_proj(self.act_fn(self.up_proj(x)) * self.gate_proj(x)))
+    
