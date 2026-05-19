@@ -92,7 +92,26 @@ v: [B, T, n_kv, D]
 - `k` 表示每个 token 在每个 kv head 上提供的索引特征
 - `v` 表示每个 token 在每个 kv head 上携带的内容
 
-### 4. RoPE 之后
+### 4. RoPE 之前的位置切片
+
+当前实现里，`cos/sin` 的切片职责已经上移到了模型层。  
+也就是说，`Attention` 拿到的 `position_embedding` 不是整张 `[max_seq_len, D]` 表，而是当前这次 forward 已经对齐好的局部片段：
+
+```text
+cos: [T, D]
+sin: [T, D]
+```
+
+这里：
+
+- `T` 是当前这次 query 的 token 数
+- `D` 是单 head 维度
+- 第 `i` 行表示“当前第 `i` 个 token 的真实全局位置对应的旋转参数”
+
+这一点很重要，因为有 KV cache 时，位置偏移应当只计算一次。  
+当前设计里，**模型层负责按 `start_pos:start_pos+seq_len` 切片，Attention 只消费切好的结果**。
+
+### 5. RoPE 之后
 
 ```text
 q: [B, T, n_q, D]
@@ -102,7 +121,7 @@ k: [B, T, n_kv, D]
 shape 不变，但数值语义变成“带位置信息的 q/k”。  
 这里最容易混淆的是：RoPE 改的是 `q/k` 的坐标，不改 `v`。
 
-### 5. 拼接 KV cache
+### 6. 拼接 KV cache
 
 假设历史缓存长度是 `P`：
 
@@ -117,7 +136,7 @@ v: [B, P + T, n_kv, D]
 
 这一步之后，当前 attention 的 query 和 key/value 不再是同长度，所以后面的 `scores` 一般会从方阵变成矩形。
 
-### 6. repeat_kv
+### 7. repeat_kv
 
 ```text
 repeat_kv(k): [B, P + T, n_q, D]
@@ -132,7 +151,7 @@ $$
 
 这样每个 query head 都能拿到一份可对齐的 `k/v`。
 
-### 7. 转置到 attention 计算布局
+### 8. 转置到 attention 计算布局
 
 ```text
 q: [B, n_q, T, D]
@@ -146,7 +165,7 @@ v: [B, n_q, P + T, D]
 - 第 3 维是 token 位置
 - 最后一维是单 head 特征
 
-### 8. attention score / prob / output
+### 9. attention score / prob / output
 
 ```text
 scores: [B, n_q, T, P + T]
@@ -164,7 +183,7 @@ out:    [B, n_q, T, D]
 [B, n_q, T, T]
 ```
 
-### 9. 合并 heads
+### 10. 合并 heads
 
 ```text
 out.transpose(1, 2): [B, T, n_q, D]
@@ -195,8 +214,27 @@ o_proj:              [B, T, H]
 
 - `repeat_kv` 复制的是 `kv head`，不是复制 token，也不是复制 hidden size 维度
 
-- RoPE 的位置切片本质上也受 `past_len` 影响  
-  因为当前 query 的局部下标不等于它的全局位置
+- `past_len` 影响的是“模型层如何切 RoPE 位置表”，而不是每层 Attention 都自己再切一次  
+  否则会出现位置二次偏移
+
+## 模型级位置调度
+
+当前实现已经进入“模型主干 + 多层 block”阶段，因此 RoPE 的位置调度不再只属于 `Attention`，而是模型级逻辑的一部分：
+
+```text
+MokioMind.forward
+-> 根据 past_key_values 计算 start_pos
+-> 从 freqs_cos / freqs_sin 中切出当前 [T, D]
+-> 传给每一层 block
+-> block 再传给 self_attn
+```
+
+这层设计的意义是：
+
+- `MokioMind` 负责管理全局位置
+- `Attention` 负责消费已经对齐好的位置参数
+
+职责分开之后，`Attention` 就不需要再自己推导“当前位置在整段序列里是多少”。
 
 ## 当前 self 中的核心实现代码
 
@@ -253,10 +291,7 @@ class Attention(nn.Module):
         k = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
         v = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
-        past_len = 0 if past_key_value is None else past_key_value[0].shape(1)
         cos, sin = position_embedding
-        cos = cos[past_len:past_len + seq_len]
-        sin = sin[past_len:past_len + seq_len]
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if past_key_value is not None:
