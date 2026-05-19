@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from transformers import PretrainedConfig
 
@@ -79,6 +79,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
+from transformers import PretrainedModel, GenerationMixin
 
 # -------------------实现rmsnorm—-------------
 class RMSNorm(nn.Module):
@@ -96,7 +97,7 @@ class RMSNorm(nn.Module):
         return self.weight * self._norm(x.float()).type_as(x)
 
 # ------------------实现yarn-------------------
-def precompute_freqs_cis(dim:int, end:int(32 * 1024), rope_base, rope_scaling:Optional[dict]=None):
+def precompute_freqs_cis(dim:int, end:int = int(32 * 1024), rope_base: float = 1e6, rope_scaling:Optional[dict]=None):
     # 初始化rope频率
     freqs, attn_factor = (1.0 / (rope_base ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim)), 1.0)
 
@@ -108,28 +109,28 @@ def precompute_freqs_cis(dim:int, end:int(32 * 1024), rope_base, rope_scaling:Op
                                                   rope_scaling["beta_slow"]
     )
         
-    # 推理长度大于训练长度， 使用缩放
-    if end > orig_max:
-        # 计算波长b到i的映射
-        inv_dim = lambda b : (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+        # 推理长度大于训练长度， 使用缩放
+        if end > orig_max:
+            # 计算波长b到i的映射
+            inv_dim = lambda b : (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
 
-        # 划分高低维度， low : 不需要缩放的高频部分， high : 需要缩放的低频部分
-        low = max(math.floor(inv_dim(beta_fast)), 0)
-        high = min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
+            # 划分高低维度， low : 不需要缩放的高频部分， high : 需要缩放的低频部分
+            low = max(math.floor(inv_dim(beta_fast)), 0)
+            high = min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
 
-        # 计算缩放因子
-        # low之前ramp为0， high之后ramp为1， 之间线性变化
-        ramp = torch.clamp(
-            (torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001),
-            0,
-            1
-        )
+            # 计算缩放因子
+            # low之前ramp为0， high之后ramp为1， 之间线性变化
+            ramp = torch.clamp(
+                (torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001),
+                0,
+                1
+            )
 
-        # if ramp == 0： 高频， 系数为1， 原频率不变
-        # if ramp == 1: 低频， 系数为1/factor， 对频率进行线性插值缩放
-        # else: 平滑过渡
-        freqs = freqs * (1 - ramp + ramp / factor)
-
+            # if ramp == 0： 高频， 系数为1， 原频率不变
+            # if ramp == 1: 低频， 系数为1/factor， 对频率进行线性插值缩放
+            # else: 平滑过渡
+            freqs = freqs * (1 - ramp + ramp / factor)
+ 
     # 根据end， 生成位置索引t
     t = torch.arange(end, device=freqs.device).float()
 
@@ -204,15 +205,8 @@ class Attention(nn.Module):
         k = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
         v = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
-        # q, k应用rope位置编码
-        # past_len : 已经计算过的token数
-        # seq_len : 当前输入的token数
-        # 在有kvcache时， rope位置为past_len到past_len + seq_len
-        past_len = 0 if past_key_value is None else past_key_value[0].shape[1]
-
+        # q, k应用rope位置编码, 位置在模型层切片， attention直接消费
         cos, sin = position_embedding
-        cos = cos[past_len:past_len + seq_len]
-        sin = sin[past_len:past_len + seq_len]
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # 拼接kvcache
@@ -363,3 +357,33 @@ class MokioMind(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states, presents
+    
+class MokioMindForCausalLM(PretrainedModel, GenerationMixin):  
+    config_class = MokioMindConfig
+    def __init__(self, config:MokioMindConfig):
+        self.config = config
+
+        super().__init__(config) 
+
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        
+        # 权重共享
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+        self.OUT = CausalLMOutputWithPast()
+
+    def forward(self, input_ids:Optional[torch.Tensor]=None, attention_mask:Optional[torch.Tensor]=None, past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None, use_cache=False, Logits_to_keep:Union[int, torch.Tensor]=0, **args):
+        hideen_states, past_key_values = self.model(input_ids, attention_mask, past_key_values, use_cache, **args)
+
+        slice_indices = (
+            slice(-Logits_to_keep, None)
+            if isinstance(Logits_to_keep, int)
+            else Logits_to_keep
+        )
+
+        logits = self.lm_head(hideen_states[:, slice_indices, :])
+        self.OUT.__setitem__("logits", logits)
+        self.OUT.__setitem__("past_key_values", past_key_values)
+        self.OUT.__setitem__("hidden_states", hideen_states)
+
+        return self.OUT
